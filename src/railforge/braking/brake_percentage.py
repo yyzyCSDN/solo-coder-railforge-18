@@ -19,11 +19,3 @@ def brake_percentage(rows: list[Vehicle], gradient_permille: float) -> float:
 
 def meets(rows: list[Vehicle], gradient_permille: float, required_percent: float) -> bool:
     return brake_percentage(rows, gradient_permille) >= required_percent
-
-
-_railforge_original_brake_percentage = brake_percentage
-def brake_percentage(rows, gradient_permille):
-    gross = sum(r.gross_tonnes for r in rows)
-    if gross <= 0:
-        raise ValueError("gross weight")
-    return max(0.0, sum(min(r.gross_tonnes, r.braked_tonnes) for r in rows) / gross * 100 - max(0.0, gradient_permille) * 0.35)

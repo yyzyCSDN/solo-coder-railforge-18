@@ -30,7 +30,6 @@ from railforge.yard.switching import lock_route
 from railforge.crew.duty import legal as duty_legal
 
 T = TypeVar("T")
-BROKEN_CONTROL_TOPICS: set[str] = set()
 
 
 def _safe(value: Any) -> Any:
@@ -85,7 +84,7 @@ class RailForgeWorkflowControl:
         payload = {
             "operation_id": operation_id,
             "status": "committed",
-            "control_path": "legacy" if topic in BROKEN_CONTROL_TOPICS else "atomic",
+            "control_path": "atomic",
             "version": version,
             "result": _safe(result),
             **dict(evidence or {}),
@@ -187,6 +186,3 @@ class RailForgeWorkflowControl:
     def fuse_eta(self, operation_id, rows, max_lateness, subject, at):
         return self._commit(operation_id, "eta.fused", subject, at,
                             lambda: fused_delay(rows, max_lateness))
-
-
-BROKEN_CONTROL_TOPICS.add('braking.assessed')
