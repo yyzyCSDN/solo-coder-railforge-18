@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from railforge.cargo.segregation import violations
+from railforge.braking.brake_percentage import assess_brakes
 from railforge.commercial.contract_capacity import allocate as allocate_capacity
 from railforge.control.recovery import choose as choose_recovery
 from railforge.customs.holds import active
@@ -86,8 +87,17 @@ class RailForgeFeatureService:
         def action():
             if not releasable(evidence, policy, check_at):
                 raise ValueError("maintenance evidence incomplete")
-            percentage = self.control.assess_brakes(operation_id + ":brakes", brake_rows, gradient, operation_id, at).result
-            return {"released": True, "brake_percentage": percentage}
+            assessment = assess_brakes(brake_rows, gradient)
+            return {
+                "released": True,
+                "brake_percentage": assessment.brake_percentage,
+                "raw_brake_percentage": assessment.raw_percentage,
+                "gradient_penalty": assessment.gradient_penalty,
+                "available_vehicles": assessment.available_vehicles,
+                "total_vehicles": assessment.total_vehicles,
+                "unavailable_vehicle_ids": list(assessment.unavailable_vehicle_ids),
+                "brake_assessment": assessment,
+            }
         return self.control.run(operation_id, "feature.vehicle.release", operation_id, at, action)
 
     def reserve_capacity(self, operation_id, requests, resources, at):

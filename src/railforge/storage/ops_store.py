@@ -36,3 +36,7 @@ class VersionedStore:
         with self._lock:
             return dict(self._rows)
 
+    def restore(self, snapshot: dict[str, VersionedValue]) -> None:
+        with self._lock:
+            self._rows = dict(snapshot)
+

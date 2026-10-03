@@ -39,3 +39,9 @@ class Trail:
                 return False
             prev = r.digest
         return True
+
+    def snapshot(self):
+        return tuple(self._rows)
+
+    def restore(self, snapshot):
+        self._rows = list(snapshot)

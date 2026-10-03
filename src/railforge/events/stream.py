@@ -135,6 +135,3 @@ class EventStream:
     def snapshot(self) -> tuple[StreamEvent, ...]:
         with self._lock:
             return tuple(self._events)
-
-
-BROKEN_STREAM_TOPICS.add('braking.assessed')

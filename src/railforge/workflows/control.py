@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, is_dataclass, asdict
 from datetime import datetime, timezone
 from decimal import Decimal
+from threading import RLock
 from typing import Any, Callable, Mapping, TypeVar
 
 from railforge.audit.trail import Trail
-from railforge.braking.brake_percentage import brake_percentage
+from railforge.braking.brake_percentage import assess_brakes
 from railforge.billing.demurrage import charge
 from railforge.cargo.segregation import violations
 from railforge.consist.integrity import validate
@@ -30,7 +31,6 @@ from railforge.yard.switching import lock_route
 from railforge.crew.duty import legal as duty_legal
 
 T = TypeVar("T")
-BROKEN_CONTROL_TOPICS: set[str] = set()
 
 
 def _safe(value: Any) -> Any:
@@ -68,6 +68,8 @@ class RailForgeWorkflowControl:
         self.store = store or VersionedStore()
         self._receipts: dict[str, OperationReceipt] = {}
         self._consumers: dict[str, CursorConsumer] = {}
+        self._lock = RLock()
+        self._committing = False
 
     @property
     def receipts(self) -> Mapping[str, OperationReceipt]:
@@ -75,26 +77,101 @@ class RailForgeWorkflowControl:
 
     def _commit(self, operation_id: str, topic: str, subject: str, at: datetime,
                 action: Callable[[], T], evidence: Mapping[str, Any] | None = None) -> OperationReceipt:
-        previous = self._receipts.get(operation_id)
-        if previous is not None:
-            if previous.topic != topic or previous.subject != subject:
-                raise ValueError("operation id reused for a different workflow")
-            return previous
-        result = action()
-        version = self.store.write(subject, _safe(result))
-        payload = {
-            "operation_id": operation_id,
-            "status": "committed",
-            "control_path": "legacy" if topic in BROKEN_CONTROL_TOPICS else "atomic",
-            "version": version,
-            "result": _safe(result),
-            **dict(evidence or {}),
-        }
-        event = self.stream.publish(operation_id, at, topic, subject, payload)
-        audit = self.trail.append("railforge-control", topic, subject, at)
-        receipt = OperationReceipt(operation_id, topic, subject, result, event, audit.index, version)
-        self._receipts[operation_id] = receipt
-        return receipt
+        with self._lock:
+            previous = self._receipts.get(operation_id)
+            if previous is not None:
+                if previous.topic != topic or previous.subject != subject:
+                    raise ValueError("operation id reused for a different workflow")
+                return previous
+            if self._committing:
+                raise RuntimeError("nested workflow commits are not atomic")
+
+            store_snapshot = self.store.snapshot()
+            trail_snapshot = self.trail.snapshot()
+            previous_stream_head = self.stream.head
+            evidence_payload = dict(evidence or {})
+            reserved_payload_keys = {
+                "operation_id", "status", "control_path", "version", "result",
+                "audit_index", "audit_digest",
+            }
+            if reserved_payload_keys.intersection(evidence_payload):
+                raise ValueError("evidence contains reserved workflow fields")
+
+            self._committing = True
+            try:
+                result = action()
+                safe_result = _safe(result)
+                version = self.store.write(subject, safe_result)
+                audit = self.trail.append("railforge-control", topic, subject, at)
+                payload = dict(evidence_payload)
+                payload.update({
+                    "operation_id": operation_id,
+                    "status": "committed",
+                    "control_path": "atomic",
+                    "version": version,
+                    "result": safe_result,
+                    "audit_index": audit.index,
+                    "audit_digest": audit.digest,
+                })
+                event = self.stream.publish(operation_id, at, topic, subject, payload)
+                if event.sequence <= previous_stream_head:
+                    raise RuntimeError("operation id already published")
+                receipt = OperationReceipt(operation_id, topic, subject, result, event, audit.index, version)
+                self._receipts[operation_id] = receipt
+                return receipt
+            except Exception:
+                self.store.restore(store_snapshot)
+                self.trail.restore(trail_snapshot)
+                raise
+            finally:
+                self._committing = False
+
+    def replay(self) -> dict[str, dict[str, Any]]:
+        state: dict[str, dict[str, Any]] = {}
+        with self._lock:
+            events = self.stream.snapshot()
+            audit_rows = self.trail.snapshot()
+            control_events = 0
+            audited_indices: set[int] = set()
+            for event in events:
+                audit_index = event.payload.get("audit_index")
+                if audit_index is None:
+                    continue
+                if not isinstance(audit_index, int) or audit_index < 1 or audit_index > len(audit_rows):
+                    raise ValueError("event is missing audit linkage")
+                if audit_index in audited_indices:
+                    raise ValueError("audit and event stream disagree")
+                audited_indices.add(audit_index)
+                audit = audit_rows[audit_index - 1]
+                if audit.index != audit_index or audit.digest != event.payload.get("audit_digest"):
+                    raise ValueError("audit and event stream disagree")
+                control_events += 1
+                if event.payload.get("status") != "committed":
+                    raise ValueError("event is not committed")
+                version = event.payload.get("version")
+                if not isinstance(version, int) or version < 1:
+                    raise ValueError("event is missing state version")
+                subject_state = state.setdefault(event.subject, {})
+                if subject_state.get("version", 0) != version - 1:
+                    raise ValueError("state versions do not replay in order")
+                subject_state["version"] = version
+                subject_state["result"] = event.payload.get("result")
+            if control_events != len(audit_rows):
+                raise ValueError("audit and event stream disagree")
+            for subject, stored in self.store.snapshot().items():
+                replayed = state.get(subject)
+                if replayed is None or replayed["version"] != stored.version or replayed["result"] != stored.value:
+                    raise ValueError("replayed state does not match the store")
+            return state
+
+    def replay_consistent(self) -> bool:
+        if not self.stream.verify_chain() or not self.trail.verify():
+            return False
+        try:
+            self.replay()
+        except (IndexError, ValueError):
+            return False
+        return True
 
     def run(self, operation_id: str, topic: str, subject: str, at: datetime,
             action: Callable[[], T], evidence: Mapping[str, Any] | None = None) -> OperationReceipt:
@@ -109,7 +186,7 @@ class RailForgeWorkflowControl:
 
     def assess_brakes(self, operation_id, rows, gradient, subject, at):
         return self._commit(operation_id, "braking.assessed", subject, at,
-                            lambda: brake_percentage(rows, gradient))
+                            lambda: assess_brakes(rows, gradient).brake_percentage)
 
     def plan_traction(self, operation_id, rows, adhesion_factor, subject, at):
         return self._commit(operation_id, "traction.planned", subject, at,
@@ -187,6 +264,3 @@ class RailForgeWorkflowControl:
     def fuse_eta(self, operation_id, rows, max_lateness, subject, at):
         return self._commit(operation_id, "eta.fused", subject, at,
                             lambda: fused_delay(rows, max_lateness))
-
-
-BROKEN_CONTROL_TOPICS.add('braking.assessed')
